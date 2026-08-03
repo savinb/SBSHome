@@ -1,0 +1,376 @@
+import asyncio, json, threading, base64, customtkinter as ctk
+from tapo import ApiClient
+
+# =====================================================================
+# КОНФИГУРАЦИОННЫЕ ДАННЫЕ И НАСТРОЙКИ УСТРОЙСТВ
+# =====================================================================
+
+# Логин и пароль от единой учетной записи TP-Link Tapo
+TP_LINK_EMAIL, TP_LINK_PASSWORD = "savinb1968@gmail.com", "Termi2107"
+
+# Словарь со списком всех подключаемых устройств умного дома.
+# Ключ (например, "P110") — уникальный системный идентификатор.
+# Значение — локальный IP-адрес и тип девайса.
+DEVICES = {
+    "P110": {"ip": "192.168.0.147", "type": "p110"},
+    "P300": {"ip": "192.168.0.101", "type": "p300"},
+    "L535_1": {"ip": "192.168.0.112", "type": "bulb"},
+    "L535_2": {"ip": "192.168.0.104", "type": "bulb"},
+    "L920": {"ip": "192.168.0.173", "type": "strip"}
+}
+
+
+# =====================================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# =====================================================================
+
+def decode_name(b64, default):
+    """
+    Декодирует имя устройства из формата Base64, которое присылает Tapo API.
+    """
+    try:
+        # Проверяем строку на валидность Base64 и декодируем в читаемый текст
+        return base64.b64decode(b64, validate=True).decode('utf-8') if b64 else default
+    except:
+        # Если это не Base64, возвращаем объект как обычную строку
+        return str(b64)
+
+
+# =====================================================================
+# ГЛАВНЫЙ КЛАСС ПРИЛОЖЕНИЯ ГРАФИЧЕСКОГО ИНТЕРФЕЙСА
+# =====================================================================
+
+class SmartHomeApp(ctk.CTk):
+    def __init__(self):
+        # Инициализируем базовый конструктор родительского класса CTk
+        super().__init__()
+
+        # Настройка главного окна: заголовок и стартовые размеры (Ширина x Высота)
+        self.title("Умный Дом Tapo")
+        self.geometry("460x890")
+        self.wm_iconbitmap("icon.ico")
+
+        # Установка визуальной темы оформления (темная тема)
+        ctk.set_appearance_mode("dark")
+
+        # Создаем изолированный асинхронный цикл событий (Event Loop) для библиотеки asyncio.
+        # Сетевые запросы Tapo будут выполняться параллельно с работой GUI.
+        self.loop = asyncio.new_event_loop()
+
+        # Инициализируем словари и списки для хранения системных данных:
+        # - handlers: асинхронные объектыpip install pystray pillow управления устройствами
+        # - p300_slots: уникальные device_id розеток для сетевого фильтра P300
+        # - ui_elements: ссылки на графические элементы (кнопки, метки, ползунки)
+        self.handlers, self.p300_slots, self.ui_elements = {}, [], {}
+
+        # =================================================================
+        # ЦИКЛ АВТОМАТИЧЕСКОЙ СБОРКИ ГРАФИЧЕСКОГО ИНТЕРФЕЙСА (GUI)
+        # =================================================================
+        for key, dev in DEVICES.items():
+            # Отрисовываем серую разделительную надпись с системным именем устройства
+            ctk.CTkLabel(self, text=f"--- {key} ---", text_color="gray").pack(pady=2)
+
+            # --- ВЕРСТКА ДЛЯ СЕТЕВОГО ФИЛЬТРА P300 ---
+            if dev["type"] == "p300":
+                # Создаем контейнер ui_elements для P300. Записываем туда метку статуса.
+                self.ui_elements[key] = {
+                    "title": ctk.CTkLabel(self, text="Подключение...", font=("Arial", 12, "bold")),
+                    "slots": []
+                }
+                # Отображаем главный статус-заголовок фильтра на экране
+                self.ui_elements[key]["title"].pack()
+
+                # Сетевой фильтр Tapo P300 аппаратно имеет ровно 3 управляемые розетки
+                for i in range(3):
+                    # Создаем текстовую метку для отображения имени конкретного слота
+                    lbl = ctk.CTkLabel(self, text=f"Слот №{i + 1}...", font=("Arial", 11))
+                    lbl.pack()
+
+                    # Создаем фрейм (контейнер) для горизонтального размещения кнопок Вкл/Выкл
+                    f = ctk.CTkFrame(self)
+                    f.pack()
+
+                    # Создаем кнопку включения слота. Изначально она заблокирована.
+                    b_on = ctk.CTkButton(f, text="Вкл", width=70, state="disabled",
+                                         command=lambda idx=i: self.click_p300(idx, True))
+                    b_on.pack(side="left", padx=2)
+
+                    # Создаем кнопку выключения слота. Изначально заблокирована.
+                    b_off = ctk.CTkButton(f, text="Выкл", width=70, state="disabled",
+                                          command=lambda idx=i: self.click_p300(idx, False))
+                    b_off.pack(side="left", padx=2)
+
+                    # Сохраняем ссылки на метку и кнопки данного слота
+                    self.ui_elements[key]["slots"].append({"lbl": lbl, "on": b_on, "off": b_off})
+            # --- ВЕРСТКА ДЛЯ ВСЕХ ОСТАЛЬНЫХ УСТРОЙСТВ (P110, L535, L920) ---
+            else:
+                # Отрисовываем жирный статус-текст загрузки устройства
+                lbl = ctk.CTkLabel(self, text=f"Загрузка {key}...", font=("Arial", 12, "bold"))
+                lbl.pack()
+
+                # Если устройство имеет тип "p110" (умная розетка с энергомониторингом),
+                # создаем дополнительную текстовую метку для вывода текущей мощности в Ваттах.
+                p_lbl = ctk.CTkLabel(self, text="Потребление: -- Вт", font=("Arial", 11)) if dev[
+                                                                                                 "type"] == "p110" else None
+                if p_lbl:
+                    p_lbl.pack()
+
+                # Создаем фрейм (контейнер) для горизонтального размещения кнопок Вкл/Выкл
+                f = ctk.CTkFrame(self)
+                f.pack()
+
+                # Кнопка общего включения устройства. Передает системный ключ (key) и True.
+                b_on = ctk.CTkButton(f, text="Вкл", width=70, state="disabled",
+                                     command=lambda k=key: self.click_direct(k, True))
+                b_on.pack(side="left", padx=2)
+
+                # Кнопка общего выключения устройства. Передает системный ключ (key) и False.
+                b_off = ctk.CTkButton(f, text="Выкл", width=70, state="disabled",
+                                      command=lambda k=key: self.click_direct(k, False))
+                b_off.pack(side="left", padx=2)
+
+                # Если устройство является лампой ("bulb") или лентой ("strip"),
+                # создаем слайдер (ползунок) для регулировки яркости в диапазоне от 1 до 100%.
+                sld = ctk.CTkSlider(self, from_=1, to=100, width=180, state="disabled",
+                                    command=lambda v, k=key: self.slide_device(k, v)) if dev["type"] in ["bulb",
+                                                                                                         "strip"] else None
+                if sld:
+                    sld.pack(pady=2)
+
+                # Специальный блок: если это светодиодная лента ("strip"),
+                # создаем под слайдером отдельный фрейм с кнопками управления пресетами света.
+                if dev["type"] == "strip":
+                    f_fx = ctk.CTkFrame(self)
+                    f_fx.pack(pady=2)
+
+                    # Кнопка переключения ленты в тёплый спектр свечения
+                    self.b_fx_on = ctk.CTkButton(f_fx, text="Тёплый свет", width=110, state="disabled",
+                                                 command=self.click_fx_on)
+                    self.b_fx_on.pack(side="left", padx=2)
+
+                    # Кнопка переключения ленты в нейтральный дневной свет
+                    self.b_fx_off = ctk.CTkButton(f_fx, text="Дневной свет", width=110, state="disabled",
+                                                  command=self.click_fx_off)
+                    self.b_fx_off.pack(side="left", padx=2)
+
+                # Сохраняем ссылки на элементы интерфейса текущего устройства в глобальную структуру ui_elements
+                self.ui_elements[key] = {"lbl": lbl, "p_lbl": p_lbl, "on": b_on, "off": b_off, "sld": sld}
+
+        # ЗАПУСК ФОНОВОГО АСИНХРОННОГО ПОТОКА КЛИЕНТА
+        # Создаем и запускаем фоновый демон-поток (Thread). Внутри него мы принудительно регистрируем
+        # созданный асинхронный loop и запускаем его бесконечно (run_forever).
+        threading.Thread(target=lambda: (asyncio.set_event_loop(self.loop), self.loop.run_forever()),
+                         daemon=True).start()
+
+        # Безопасно отправляем главную асинхронную задачу инициализации connect_all на выполнение в работающий фоновый поток
+        asyncio.run_coroutine_threadsafe(self.connect_all(), self.loop)
+
+    def set_btn(self, b_on, b_off, is_on):
+        """
+        Переключает доступность (активность) кнопок Вкл/Выкл в зависимости от текущего состояния реле девайса.
+        Если устройство уже ВКЛЮЧЕНО — кнопка "Вкл" блокируется, а "Выкл" становится доступной для нажатия.
+        """
+        b_on.configure(state="disabled" if is_on else "normal")
+        b_off.configure(state="normal" if is_on else "disabled")
+
+    async def connect_all(self):
+        """
+        Фоновая задача: авторизуется в облаке Tapo, опрашивает каждое устройство по IP,
+        получает их реальные имена, статусы питания, заполняет хэндлеры и активирует элементы GUI.
+        """
+        client = ApiClient(TP_LINK_EMAIL, TP_LINK_PASSWORD)
+
+        for k, dev in DEVICES.items():
+            try:
+                # --- ПОДКЛЮЧЕНИЕ УМНОЙ РОЗЕТКИ P110 ---
+                if dev["type"] == "p110":
+                    h = await client.p110(dev["ip"])
+                    self.handlers[k] = h
+                    inf = await h.get_device_info_json()
+                    name = decode_name(inf.get('nickname', inf.get('result', {}).get('nickname', '')), "Розетка P110")
+                    self.ui_elements[k]["lbl"].configure(text=name, text_color="green")
+                    is_on = inf.get('device_on', inf.get('result', {}).get('device_on', False))
+                    self.set_btn(self.ui_elements[k]["on"], self.ui_elements[k]["off"], is_on)
+                    asyncio.run_coroutine_threadsafe(self.p110_loop(k), self.loop)
+
+                # --- ПОДКЛЮЧЕНИЕ УМНОЙ ЛАМПЫ L535 ---
+                elif dev["type"] == "bulb":
+                    h = await client.l530(dev["ip"])
+                    self.handlers[k] = h
+                    inf = await h.get_device_info_json()
+                    name = decode_name(inf.get('nickname', inf.get('result', {}).get('nickname', '')), "Лампа L535")
+                    self.ui_elements[k]["lbl"].configure(text=name, text_color="green")
+                    is_on = inf.get('device_on', inf.get('result', {}).get('device_on', False))
+                    self.set_btn(self.ui_elements[k]["on"], self.ui_elements[k]["off"], is_on)
+                    self.ui_elements[k]["sld"].configure(state="normal")
+                    bright = inf.get('brightness', inf.get('result', {}).get('brightness', 50))
+                    self.ui_elements[k]["sld"].set(int(bright))                # --- ПОДКЛЮЧЕНИЕ УМНОЙ СВЕТОДИОДНОЙ ЛЕНТЫ L920 ---
+                elif dev["type"] == "strip":
+                    # Локально подключаемся к ленте L920 через базовый метод ламп .l530
+                    h = await client.l530(dev["ip"])
+                    self.handlers[k] = h
+
+                    # Считываем JSON-лог параметров светодиодной ленты
+                    inf = await h.get_device_info_json()
+                    name = decode_name(inf.get('nickname', inf.get('result', {}).get('nickname', '')), "Умная лента L920")
+
+                    # Отображаем имя ленты на экране зеленым цветом
+                    self.ui_elements[k]["lbl"].configure(text=name, text_color="green")
+
+                    is_on = inf.get('device_on', inf.get('result', {}).get('device_on', False))
+                    self.set_btn(self.ui_elements[k]["on"], self.ui_elements[k]["off"], is_on)
+
+                    # Активируем ползунок яркости ленты и выставляем текущий процент диммирования из памяти чипа
+                    self.ui_elements[k]["sld"].configure(state="normal")
+                    bright = inf.get('brightness', inf.get('result', {}).get('brightness', 50))
+                    self.ui_elements[k]["sld"].set(int(bright))
+
+                    # Дополнительно разблокируем (активируем) кнопки выбора пресетов «Тёплый свет» и «Дневной свет»
+                    self.b_fx_on.configure(state="normal")
+                    self.b_fx_off.configure(state="normal")
+
+                # --- ПОДКЛЮЧЕНИЕ УМНОГО СЕТЕВОГО ФИЛЬТРА P300 ---
+                elif dev["type"] == "p300":
+                    # Локально подключаемся к умному удлинителю P300 по IP
+                    h = await client.p300(dev["ip"])
+                    self.handlers[k] = h
+
+                    # Фильтр P300 — составное устройство. Запрашиваем массив его дочерних гнезд (child devices)
+                    data = await h.get_child_device_list_json()
+
+                    # Парсим список дочерних устройств в зависимости от ответа API
+                    slots = data if isinstance(data, list) else data.get('child_device_list', [])
+
+                    # Извлекаем и сохраняем длинные уникальные строковые device_id каждого гнезда фильтра.
+                    # По этим ID мы будем точечно включать и выключать конкретные розетки в будущем.
+                    self.p300_slots = [c['device_id'] for c in slots if 'device_id' in c]
+
+                    # Обновляем заголовок сетевого фильтра в GUI
+                    self.ui_elements[k]["title"].configure(text="Фильтр P300: Подключен", text_color="green")
+
+                    # Проходим циклом по полученным физическим гнездам фильтра (ограничиваемся первыми тремя)
+                    for i, child in enumerate(slots):
+                        if i < 3:
+                            ui = self.ui_elements[k]["slots"][i]
+                            # Считываем и декодируем имя, которое вы дали розетке в приложении Tapo (например, "Чайник")
+                            slot_name = decode_name(child.get('nickname', ''), f"Слот {i + 1}")
+                            ui["lbl"].configure(text=slot_name)
+                            # Считываем текущее состояние питания реле конкретной розетки удлинителя и активируем кнопки
+                            self.set_btn(ui["on"], ui["off"], child.get('device_on', False))
+
+            except Exception as e:
+                # ОБРАБОТКА ОШИБОК: Если устройство выключено из розетки или неверно указан IP —
+                # перехватываем исключение и пишем текст ошибки красным цветом прямо на экране приложения
+                if "lbl" in self.ui_elements[k]:
+                    self.ui_elements[k]["lbl"].configure(text=f"Ошибка: {e}", text_color="red")
+
+    # =====================================================================
+    # АСИНХРОННЫЕ ФУНКЦИИ ОБРАТНОЙ СВЯЗИ И ПЕРЕКЛЮЧЕНИЯ УСТРОЙСТВ В СЕТИ
+    # =====================================================================
+
+    async def p110_loop(self, key):
+        """
+        Бесконечный фоновый цикл опроса энергопотребления умной розетки Tapo P110.
+        Опрашивает чип счетчика каждые 3 секунды.
+        """
+        while True:
+            if self.handlers.get(key):
+                try:
+                    # Запрашиваем текущие телеметрические данные электроники розетки
+                    eng = await self.handlers[key].get_energy_usage()
+                    # Извлекаем чистую текущую мощность в Ваттах и выводим в GUI с округлением до двух знаков
+                    self.ui_elements[key]["p_lbl"].configure(text=f"Потребление: {eng.current_power:.2f} Вт")
+                except:
+                    pass # Если пакет потерялся из-за помех Wi-Fi, просто пропускаем шаг
+            # Засыпаем строго на 3 секунды, освобождая асинхронный поток для других девайсов
+            await asyncio.sleep(3)
+
+    def click_direct(self, key, turn_on):
+        """
+        Обработчик клика по кнопкам Вкл/Выкл для обычных устройств (P110, L535, L920).
+        """
+        h = self.handlers.get(key)
+        if h:
+            async def act():
+                # Вызываем нативные асинхронные команды библиотеки в зависимости от переданного флага turn_on
+                if turn_on: await h.on()
+                else: await h.off()
+                # После успешного ответа железки меняем доступность кнопок в окне программы
+                self.set_btn(self.ui_elements[key]["on"], self.ui_elements[key]["off"], turn_on)
+            # Отправляем корутину выполнения команды на исполнение в фоновый loop
+            asyncio.run_coroutine_threadsafe(act(), self.loop)
+
+    def click_p300(self, idx, turn_on):
+        """
+        Обработчик клика по кнопкам Вкл/Выкл для конкретного гнезда сетевого фильтра P300.
+        """
+        h = self.handlers.get("P300")
+        # Проверяем, что хэндлер фильтра активен и сохраненный индекс ID слота существует
+        if h and len(self.p300_slots) > idx:
+            async def act():
+                # Инициализируем объект управления конкретной розетки, передавая её аппаратный device_id
+                slot = await h.plug(self.p300_slots[idx])
+                # Отправляем команду включения или выключения на реле выбранного гнезда
+                if turn_on: await slot.on()
+                else: await slot.off()
+                # Обновляем состояние кнопок конкретной строки розетки на экране
+                self.set_btn(self.ui_elements["P300"]["slots"][idx]["on"],
+                             self.ui_elements["P300"]["slots"][idx]["off"], turn_on)
+            asyncio.run_coroutine_threadsafe(act(), self.loop)
+
+    def slide_device(self, key, value):
+        """
+        Обработчик перемещения ползунка яркости для умных ламп L535.
+        """
+        h = self.handlers.get(key)
+        # Если хэндлер лампы существует, шлем команду set_brightness, приводя вещественное значение слайдера к целому числу (int)
+        if h:
+            asyncio.run_coroutine_threadsafe(h.set_brightness(int(value)), self.loop)
+
+    def slide_strip(self, value):
+        """
+        Обработчик перемещения ползунка яркости для светодиодной ленты Tapo L920.
+        Вызывает базовый метод изменения уровня свечения чипа.
+        """
+        h = self.handlers.get("L920")
+        if h:
+            asyncio.run_coroutine_threadsafe(h.set_brightness(int(value)), self.loop)
+
+    def click_fx_on(self):
+        """
+        Обработчик нажатия на кнопку «Тёплый свет» для ленты L920.
+        """
+        h = self.handlers.get("L920")
+        if h:
+            async def act():
+                try:
+                    # Переводим контроллер светодиодов ленты L920 в режим тёплой ламповой температуры 2500 Кельвин
+                    await h.set_color_temperature(2500)
+                    print("Включен уютный тёплый свет 2500K")
+                except Exception as e:
+                    print(f"Ошибка переключения температуры: {e}")
+            asyncio.run_coroutine_threadsafe(act(), self.loop)
+
+    def click_fx_off(self):
+        """
+        Обработчик нажатия на кнопку «Дневной свет» для ленты L920.
+        """
+        h = self.handlers.get("L920")
+        if h:
+            async def act():
+                try:
+                    # Переводим контроллер светодиодов ленты L920 в режим нейтральной белой температуры 4000 Кельвин
+                    await h.set_color_temperature(4000)
+                    print("Включен нейтральный дневной свет 4000K")
+                except Exception as e:
+                    print(f"Ошибка переключения температуры: {e}")
+            asyncio.run_coroutine_threadsafe(act(), self.loop)
+
+
+# =====================================================================
+# ТОЧКА ВХОДА В ПРОГРАММУ
+# =====================================================================
+if __name__ == "__main__":
+    # Создаем экземпляр нашего приложения и запускаем главный цикл обработки системных сообщений Windows (mainloop)
+    SmartHomeApp().mainloop()
+
